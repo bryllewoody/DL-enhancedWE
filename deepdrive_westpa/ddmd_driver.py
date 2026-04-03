@@ -32,7 +32,8 @@ from westpa.core.h5io import tostr
 from westpa.core.segment import Segment
 from westpa.core.we_driver import WEDriver
 
-from deepdrive_westpa.nani import KmeansNANI, compute_scores, extended_comparison
+from deepdrive_westpa.nani import (KmeansNANI, compute_scores, extended_comparison, align_traj,calculate_comp_sim)
+from mdance.cluster import mdbirch
 from deepdrive_westpa.config import BaseModel
 
 log = logging.getLogger(__name__)
@@ -351,7 +352,7 @@ class DeepDriveMDDriver(WEDriver, ABC):
                 # If the parent ids match
                 if segment.parent_id == next_seg.parent_id:
                     # Add the row that corresponds to the next segment
-                    new_df = new_df.append(df.iloc[next_seg_ind])
+                    new_df = pd.concat([new_df, df.iloc[[next_seg_ind]]], ignore_index=True)
                     # Reset index
                     new_df.reset_index(drop=True, inplace=True)
                     # Adjust the weight to the segment from the bin
@@ -716,6 +717,16 @@ class MLSettings(BaseModel):
         return MLSettings(**westpa_config)
 
 
+class RealSpaceSettings(BaseModel):
+    atom_selection: str = "name CA"
+    align_method: str = "uni"
+
+    @classmethod
+    def from_westpa_config(cls) -> "RealSpaceSettings":
+        westpa_config = westpa.rc.config.get(["west", "ddwe", "realspace"], {})
+        return RealSpaceSettings(**westpa_config)
+
+
 def sorted_key(input_path):
     '''key to sort checkpoints, so we can remove natsort.natsorted as a dependency'''
     return input_path.name.replace('.', '-').split('-')[-2].zfill(8)
@@ -888,16 +899,24 @@ class MachineLearningMethod:
 
 
 class ObjectiveSettings(BaseModel):
-    # Objective method to use (lof, clustering).
+    # Objective method to use (lof, clustering, real_clustering, comp_sim).
     objective_method: str
     # Cluster resampling algorithm to use (simplified, complex).
     cluster_resample_method: Optional[str] = "complex"
     # Function to measure distance between latent space points (cosine or euclidean).
     distance_metric: Optional[str] = "cosine"
+    # How many walkers to consider for splitting and merging in real_space mode.
+    real_space_consider_for_resample: Optional[int] = 12
+    # Whether to use pcoord as a secondary ranking signal in real_space mode.
+    real_space_use_pcoord: Optional[bool] = True
     # How many walkers to consider for splitting and merging in lof.
     lof_consider_for_resample: Optional[int] = 12
     # Maximum total number of past latent space points to save for the lof scheme.
     max_past_points: Optional[int] = 2000
+    # Number of past iterations to include as context. None means use rolled context files (default behaviour).
+    context_window: Optional[int] = None
+    # mdBIRCH radius threshold; used when objective_method == "mdbirch".
+    birch_threshold: Optional[float] = 0.5
     # Number of neighbors for LOF.
     lof_n_neighbors: Optional[int] = 20
     # Maximum number of contact maps to save from each cluster.
@@ -955,10 +974,11 @@ class ObjectiveSettings(BaseModel):
             del westpa_config[key]
 
         if "knani_clusters" in westpa_config:
-            # If the clusters are a string, convert it to a tuple of ints
-            westpa_config["knani_clusters"] = literal_eval(
-                westpa_config["knani_clusters"]
-            )
+            val = westpa_config["knani_clusters"]
+
+            # Only evaluate if it's a string (e.g. "3, 10")
+            if isinstance(val, str):
+                westpa_config["knani_clusters"] = literal_eval(val)
 
         return ObjectiveSettings(**westpa_config)
 
@@ -1170,7 +1190,7 @@ class Objective:
             result = np.zeros((len(all_scores) - 2, 2))
 
             for idx, i_cluster in enumerate(all_scores[1:-1, 0]):
-                # Calculate the second derivative
+                #  the second derivative
                 result[idx] = [
                     i_cluster,
                     all_db[idx] + all_db[idx + 2] - (2 * all_db[idx + 1]),
@@ -1328,7 +1348,75 @@ class Objective:
             self.rng.integers(self.cfg.ablation_clusters) for _ in range(self.nsegs)
         ]
         return np.array(seg_labels)
+    
+    def cluster_segments_realspace(self, all_X: np.ndarray, n_atoms: int) -> Tuple[np.ndarray, np.ndarray]:
+        all_outliers = np.zeros(all_X.shape[0], dtype=bool)
 
+        if self.cfg.cluster_method == "kmeans":
+            all_labels = self.kmeans_cluster_segments(all_X)
+
+        elif self.cfg.cluster_method == "knani":
+            if isinstance(self.cfg.knani_clusters, int):
+                all_labels, _, _ = KmeansNANI(
+                    data=all_X,
+                    n_clusters=self.cfg.knani_clusters,
+                    metric=self.cfg.metric,
+                    N_atoms=n_atoms,
+                    init_type=self.cfg.init_type,
+                    percentage=self.cfg.percentage,
+                ).execute_kmeans_all()
+
+        elif self.cfg.cluster_method == "dbscan":
+            all_labels, all_outliers = self.dbscan_cluster_segments(all_X)
+
+        elif self.cfg.cluster_method == "gmm":
+            all_labels, all_outliers = self.gmm_cluster_segments(all_X)
+
+        else:
+            raise ValueError(f"Method: {self.cfg.cluster_method} unsupported")
+
+        return all_labels, all_outliers
+
+
+    def mdbirch_scoring(self, all_X: np.ndarray) -> np.ndarray:
+        """
+        Score points using mdBIRCH clustering.
+
+        Low score = novel = split candidate. High score = redundant = merge candidate.
+
+        - Singletons: score = -min_distance_to_nearest_non_singleton_centroid.
+          More isolated singletons get more negative scores, so they are split first.
+          If no non-singleton clusters exist, singletons remain at 0.
+        - Non-singletons: score = cluster_size - normalized_distance_to_centroid,
+          so score ∈ [cluster_size-1, cluster_size). Larger clusters score higher
+          (more redundant). Within a cluster, points closer to the centroid score
+          higher (merge) and peripheral points score lower (split).
+        """
+        mdbirch.set_merge('radius', features=all_X.shape[1])
+        model = mdbirch.mdBirch(threshold=self.cfg.birch_threshold, branching_factor=50)
+        model.fit(all_X)
+
+        mol_ids = model.get_cluster_mol_ids()
+        centroids = model.get_centroids()
+
+        non_singleton_centroids = np.array([c for ids, c in zip(mol_ids, centroids) if len(ids) > 1])
+        print(f"mdBIRCH: {len(mol_ids)} clusters, {sum(len(ids) == 1 for ids in mol_ids)} singletons out of {len(all_X)} points")
+
+        scores = np.zeros(len(all_X))
+        for ids, centroid in zip(mol_ids, centroids):
+            cluster_size = len(ids)
+            if cluster_size == 1:
+                if len(non_singleton_centroids) > 0:
+                    diffs = non_singleton_centroids - centroid
+                    scores[ids[0]] = -np.min(np.sum(diffs ** 2, axis=1))
+            else:
+                diffs = all_X[ids] - centroid
+                sq_dists = np.sum(diffs ** 2, axis=1)
+                max_dist = sq_dists.max()
+                norm_dists = sq_dists / max_dist if max_dist > 0 else sq_dists
+                scores[ids] = cluster_size - norm_dists
+
+        return scores
 
 class DDWESettings(BaseModel):
     # Output directory for the run.
@@ -1371,6 +1459,17 @@ class CustomDriver(DeepDriveMDDriver):
         super().__init__(rc, system)
 
         self.cfg = DDWESettings.from_westpa_config()
+
+        self.realspace_cfg = RealSpaceSettings.from_westpa_config()
+
+        if self.cfg.target_point_path is not None:
+            self.realspace_top = mdtraj.load(str(self.cfg.target_point_path))
+            self.realspace_atom_indices = self.realspace_top.top.select(
+                self.realspace_cfg.atom_selection
+            )
+        else:
+            self.realspace_top = None
+            self.realspace_atom_indices = None
 
         self.log_path = Path(f"{self.cfg.output_path}/westpa-ddmd-logs")
         os.makedirs(self.log_path, exist_ok=True)
@@ -1874,6 +1973,121 @@ class CustomDriver(DeepDriveMDDriver):
             # Run resampling for the cluster
             self.split_with_combinations(split_df, num_resamples, num_resamples)
             self.merge_with_combinations(merge_df, 2 * num_resamples, num_resamples)
+    
+    def get_realspace_ca_coords(self, cur_segments: Sequence[Segment]) -> np.ndarray:
+        try:
+            rcoords = self.get_rcoords(cur_segments)
+        except KeyError:
+            rcoords = self.get_restart_rcoords()
+
+        # concatenate current end-of-segment frames
+        rcoords = np.concatenate(rcoords)  # (n_samples, n_atoms, 3)
+
+        if self.realspace_atom_indices is None:
+            raise ValueError("No real-space atom selection is available.")
+
+        # select Cα atoms only
+        rcoords = rcoords[:, self.realspace_atom_indices, :]  # (n_samples, n_ca, 3)
+        return rcoords
+    
+    def get_prev_rcoords_training(self, cur_rcoords: np.ndarray, iters_back: int) -> np.ndarray:
+        if self.niter <= 1 or iters_back == 0:
+            return cur_rcoords
+
+        if self.niter <= iters_back:
+            iters_back = self.niter - 1
+
+        past_rcoords = np.concatenate(self.get_prev_rcoords(iters_back))
+        past_rcoords = past_rcoords[:, self.realspace_atom_indices, :]
+        return np.concatenate([cur_rcoords, past_rcoords], axis=0)
+    
+    def preprocess_realspace_rcoords(self, rcoords: np.ndarray) -> Tuple[np.ndarray, int]:
+        n_samples, n_atoms, _ = rcoords.shape
+
+        if self.realspace_top is not None:
+            # Build a Cα-only reference (mdtraj loads in nm; convert to Angstroms to match rcoords)
+            ca_ref = self.realspace_top.atom_slice(self.realspace_atom_indices)
+            ref_coords_ang = ca_ref.xyz * 10  # nm → Å
+            ca_ref_ang = mdtraj.Trajectory(ref_coords_ang, topology=ca_ref.top)
+
+            # Build trajectory from current Cα coords (already in Å)
+            traj = mdtraj.Trajectory(rcoords, topology=ca_ref.top)
+
+            # Superpose all frames onto the fixed reference
+            traj.superpose(ca_ref_ang)
+
+            X = traj.xyz.reshape(n_samples, -1)
+        else:
+            X = rcoords.reshape(n_samples, -1)
+            X = align_traj(X, N_atoms=n_atoms, align_method=self.realspace_cfg.align_method)
+
+        return X, n_atoms
+    
+    def resample_with_real_mdbirch(self, df: pd.DataFrame):
+        """
+        Resampling procedure using complementary similarity (real_space_score)
+        computed in real space.
+
+        Lower real_space_score -> more novel / more outlier-like -> split
+        Higher real_space_score -> more redundant / more central -> merge
+        """
+        if "real_space_score" in df.columns:
+            # Lower real_space_score is more interesting
+            df = df.sort_values("real_space_score", ascending=True)
+        else:
+            df = df.sample(frac=1, random_state=self.rng)
+
+        # Top novel walkers are up for splitting
+        split_df = df.head(self.objective.cfg.real_space_consider_for_resample)
+
+        # Most redundant walkers are up for merging
+        merge_df = df.tail(self.objective.cfg.real_space_consider_for_resample)
+
+        # Make split and merge sets disjoint
+        split_inds = set(split_df["inds"].values)
+        merge_df = merge_df[~merge_df["inds"].isin(split_inds)]
+
+        num_segs_to_split = len(split_df)
+        num_segs_to_merge = len(merge_df)
+
+        print("Walkers up for splitting")
+        print(split_df)
+        split_df = self.remove_underweight_segs(split_df)
+        num_segs_to_split = len(split_df)
+
+        print("Walkers up for merging")
+        print(merge_df)
+        merge_df = self.remove_overweight_segs(merge_df)
+        num_segs_to_merge = len(merge_df)
+
+        if num_segs_to_merge > 2 * num_segs_to_split:
+            num_possible_resamples = num_segs_to_split
+        else:
+            num_possible_resamples = int(num_segs_to_merge / 2)
+
+        if num_possible_resamples == 0:
+            print(f"Not enough walkers to resample on iteration {self.niter}")
+            num_resamples = 0
+        elif num_possible_resamples >= self.cfg.max_resamples:
+            num_resamples = self.cfg.max_resamples
+        else:
+            num_resamples = num_possible_resamples
+
+        print(f"Number of resamples based on the number of walkers: {num_resamples}")
+
+        if num_resamples != 0:
+            if self.objective.cfg.real_space_use_pcoord:
+                # Same logic as LOF mode: sort both subsets by pcoord,
+                # then split picks from the front and merge picks from the tail.
+                split_df = self.sort_df_lof(split_df)
+                merge_df = self.sort_df_lof(merge_df)
+            else:
+                split_df = split_df.sample(frac=1, random_state=self.rng)
+                merge_df = merge_df.sample(frac=1, random_state=self.rng)
+
+            self.split_with_combinations(split_df, num_resamples, num_resamples)
+            self.merge_with_combinations(merge_df, 2 * num_resamples, num_resamples)
+
 
     def run(
         self,
@@ -1900,6 +2114,107 @@ class CustomDriver(DeepDriveMDDriver):
                 "weight": weight,
             }
         )
+        # Initialize the objective object
+        self.objective = Objective(self.nsegs, self.niter, self.log_path, self.datasets_path)
+
+        if self.objective.cfg.objective_method == "real_clustering":
+            self.target_point = None
+
+            # 1. current Cα coordinates
+            cur_rcoords = self.get_realspace_ca_coords(cur_segments)
+            cur_X, n_atoms = self.preprocess_realspace_rcoords(cur_rcoords)
+
+            # 2. load current + saved historical context
+            self.objective.load_latent_context(cur_X, pcoords, weight)
+            all_X = self.objective.all_dcoords
+
+            # 3. cluster on real-space features
+            all_labels, all_outliers = self.objective.cluster_segments_realspace(
+                all_X, n_atoms
+            )
+
+            # 4. keep only current walkers for resampling
+            seg_labels = all_labels[: self.nsegs]
+            df["outlier"] = all_outliers[: self.nsegs]
+            df["ls_cluster"] = seg_labels
+
+            # 5. save context for future iterations
+            self.objective.save_latent_context(all_labels, all_outliers)
+
+            # 6. run existing cluster resampling
+            if self.objective.cfg.cluster_resample_method == "complex":
+                self.complex_resample_with_clusters(df)
+            else:
+                self.simplified_resample_with_clusters(df)
+
+            return
+        
+
+        if self.objective.cfg.objective_method == "real_mdbirch":
+            self.target_point = None
+
+            # 1. current Cα coordinates
+            cur_rcoords = self.get_realspace_ca_coords(cur_segments)
+
+            if self.objective.cfg.context_window is not None:
+                # 2. load cur + past N iterations directly from west.h5
+                all_rcoords = self.get_prev_rcoords_training(cur_rcoords, self.objective.cfg.context_window)
+                all_X, n_atoms = self.preprocess_realspace_rcoords(all_rcoords)
+                print(f"all_X shape: {all_X.shape}")
+
+                # 3. score current + context
+                all_real_space_scores = self.objective.mdbirch_scoring(all_X)
+
+                # 4. keep only current walkers for resampling
+                df["real_space_score"] = all_real_space_scores[: self.nsegs]
+            else:
+                # 2. preprocess current walkers only
+                cur_X, n_atoms = self.preprocess_realspace_rcoords(cur_rcoords)
+
+                # 3. load current + saved historical context
+                self.objective.load_latent_context(cur_X, pcoords, weight)
+                all_X = self.objective.all_dcoords
+                log.debug(f"all_X shape: {all_X.shape}")
+
+                # 4. score current + context
+
+                all_real_space_scores = self.objective.mdbirch_scoring(all_X)
+
+
+                # 5. keep only current walkers for resampling
+                df["real_space_score"] = all_real_space_scores[: self.nsegs]
+
+                # 6. save context for next iteration
+                self.objective.save_latent_context()
+
+            # 7. run resampling (shared logic)
+            self.resample_with_real_mdbirch(df)
+            return
+        
+
+        if self.objective.cfg.objective_method == "real_lof":
+            self.target_point = None
+
+            cur_rcoords = self.get_realspace_ca_coords(cur_segments)
+
+            if self.objective.cfg.context_window is not None:
+                all_rcoords = self.get_prev_rcoords_training(cur_rcoords, self.objective.cfg.context_window)
+                all_X, n_atoms = self.preprocess_realspace_rcoords(all_rcoords)
+                print(f"all_X shape: {all_X.shape}")
+            else:
+                cur_X, n_atoms = self.preprocess_realspace_rcoords(cur_rcoords)
+                self.objective.load_latent_context(cur_X, pcoords, weight)
+                all_X = self.objective.all_dcoords
+                self.objective.save_latent_context()
+
+            all_outliers = self.objective.lof_function(all_X)
+            df["outlier"] = all_outliers[: self.nsegs]
+            _not_sort = self.cfg.not_sort_by_rmsd
+            self.cfg.not_sort_by_rmsd = not self.objective.cfg.real_space_use_pcoord
+            self.resample_with_lof(df)
+            self.cfg.not_sort_by_rmsd = _not_sort
+            return
+
         if self.cfg.do_machine_learning:
             self.machine_learning_method = MachineLearningMethod(
                 self.niter, log_path=self.log_path
@@ -1982,7 +2297,7 @@ class CustomDriver(DeepDriveMDDriver):
                 self.objective.save_latent_context(all_labels, all_outliers)
             else:
                 # Run LOF on the full history of embeddings to assure coverage over past states
-                all_outliers = self.objective.lof_function(all_z, n_jobs=self.objective.cfg.n_jobs)
+                all_outliers = self.objective.lof_function(all_z)#, n_jobs=self.objective.cfg.n_jobs)
 
                 # Plot the latent space
                 if self.niter % self.cfg.plot_interval == 0:
