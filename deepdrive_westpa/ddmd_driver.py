@@ -899,12 +899,16 @@ class MachineLearningMethod:
 
 
 class ObjectiveSettings(BaseModel):
-    # Objective method to use (lof, clustering, real_clustering, comp_sim).
+    # Objective method to use (lof, clustering, real_mdbirch, real_lof).
     objective_method: str
     # Cluster resampling algorithm to use (simplified, complex).
     cluster_resample_method: Optional[str] = "complex"
     # Function to measure distance between latent space points (cosine or euclidean).
     distance_metric: Optional[str] = "cosine"
+    # Distance metric for real-space LOF (real_lof method). Defaults to euclidean
+    # because LOF is applied to aligned Cα coordinates where structural dissimilarity
+    # equals Euclidean distance. Cosine distance is inappropriate here.
+    real_space_lof_metric: Optional[str] = "euclidean"
     # How many walkers to consider for splitting and merging in real_space mode.
     real_space_consider_for_resample: Optional[int] = 12
     # Whether to use pcoord as a secondary ranking signal in real_space mode.
@@ -1011,6 +1015,7 @@ class Objective:
 
         self.distance_function = dist_functions[self.cfg.distance_metric]
         self.distance_metric = dist_metric[self.cfg.distance_metric]
+        self.real_space_lof_metric = dist_metric[self.cfg.real_space_lof_metric]
 
     def save_latent_context(
         self,
@@ -1114,13 +1119,14 @@ class Objective:
             self.all_pcoords = pcoords
             self.all_weights = weight
 
-    def lof_function(self, all_z: np.ndarray) -> np.ndarray:
+    def lof_function(self, all_z: np.ndarray, metric: Optional[str] = None) -> np.ndarray:
         # Time the LOF function
         start = time.time()
 
+        lof_metric = metric if metric is not None else self.distance_metric
         # Run LOF on the full history of embeddings to assure coverage over past states
         clf = LocalOutlierFactor(
-           n_neighbors=self.cfg.lof_n_neighbors, metric=self.distance_metric
+           n_neighbors=self.cfg.lof_n_neighbors, metric=lof_metric
         ).fit(all_z)
 
         # Print the timing
@@ -1190,7 +1196,7 @@ class Objective:
             result = np.zeros((len(all_scores) - 2, 2))
 
             for idx, i_cluster in enumerate(all_scores[1:-1, 0]):
-                #  the second derivative
+                # Calculate the second derivative
                 result[idx] = [
                     i_cluster,
                     all_db[idx] + all_db[idx + 2] - (2 * all_db[idx + 1]),
@@ -1348,39 +1354,10 @@ class Objective:
             self.rng.integers(self.cfg.ablation_clusters) for _ in range(self.nsegs)
         ]
         return np.array(seg_labels)
-    
-    def cluster_segments_realspace(self, all_X: np.ndarray, n_atoms: int) -> Tuple[np.ndarray, np.ndarray]:
-        all_outliers = np.zeros(all_X.shape[0], dtype=bool)
-
-        if self.cfg.cluster_method == "kmeans":
-            all_labels = self.kmeans_cluster_segments(all_X)
-
-        elif self.cfg.cluster_method == "knani":
-            if isinstance(self.cfg.knani_clusters, int):
-                all_labels, _, _ = KmeansNANI(
-                    data=all_X,
-                    n_clusters=self.cfg.knani_clusters,
-                    metric=self.cfg.metric,
-                    N_atoms=n_atoms,
-                    init_type=self.cfg.init_type,
-                    percentage=self.cfg.percentage,
-                ).execute_kmeans_all()
-
-        elif self.cfg.cluster_method == "dbscan":
-            all_labels, all_outliers = self.dbscan_cluster_segments(all_X)
-
-        elif self.cfg.cluster_method == "gmm":
-            all_labels, all_outliers = self.gmm_cluster_segments(all_X)
-
-        else:
-            raise ValueError(f"Method: {self.cfg.cluster_method} unsupported")
-
-        return all_labels, all_outliers
-
 
     def mdbirch_scoring(self, all_X: np.ndarray) -> np.ndarray:
         """
-        Score points using mdBIRCH clustering.
+        Score frames using mdBIRCH clustering.
 
         Low score = novel = split candidate. High score = redundant = merge candidate.
 
@@ -1388,8 +1365,8 @@ class Objective:
           More isolated singletons get more negative scores, so they are split first.
           If no non-singleton clusters exist, singletons remain at 0.
         - Non-singletons: score = cluster_size - normalized_distance_to_centroid,
-          so score ∈ [cluster_size-1, cluster_size). Larger clusters score higher
-          (more redundant). Within a cluster, points closer to the centroid score
+          so score is within [cluster_size-1, cluster_size). Larger clusters score higher.
+          Within a cluster, points closer to the centroid score
           higher (merge) and peripheral points score lower (split).
         """
         mdbirch.set_merge('radius', features=all_X.shape[1])
@@ -2116,38 +2093,6 @@ class CustomDriver(DeepDriveMDDriver):
         )
         # Initialize the objective object
         self.objective = Objective(self.nsegs, self.niter, self.log_path, self.datasets_path)
-
-        if self.objective.cfg.objective_method == "real_clustering":
-            self.target_point = None
-
-            # 1. current Cα coordinates
-            cur_rcoords = self.get_realspace_ca_coords(cur_segments)
-            cur_X, n_atoms = self.preprocess_realspace_rcoords(cur_rcoords)
-
-            # 2. load current + saved historical context
-            self.objective.load_latent_context(cur_X, pcoords, weight)
-            all_X = self.objective.all_dcoords
-
-            # 3. cluster on real-space features
-            all_labels, all_outliers = self.objective.cluster_segments_realspace(
-                all_X, n_atoms
-            )
-
-            # 4. keep only current walkers for resampling
-            seg_labels = all_labels[: self.nsegs]
-            df["outlier"] = all_outliers[: self.nsegs]
-            df["ls_cluster"] = seg_labels
-
-            # 5. save context for future iterations
-            self.objective.save_latent_context(all_labels, all_outliers)
-
-            # 6. run existing cluster resampling
-            if self.objective.cfg.cluster_resample_method == "complex":
-                self.complex_resample_with_clusters(df)
-            else:
-                self.simplified_resample_with_clusters(df)
-
-            return
         
 
         if self.objective.cfg.objective_method == "real_mdbirch":
@@ -2191,7 +2136,6 @@ class CustomDriver(DeepDriveMDDriver):
             self.resample_with_real_mdbirch(df)
             return
         
-
         if self.objective.cfg.objective_method == "real_lof":
             self.target_point = None
 
@@ -2207,7 +2151,7 @@ class CustomDriver(DeepDriveMDDriver):
                 all_X = self.objective.all_dcoords
                 self.objective.save_latent_context()
 
-            all_outliers = self.objective.lof_function(all_X)
+            all_outliers = self.objective.lof_function(all_X, metric=self.objective.real_space_lof_metric)
             df["outlier"] = all_outliers[: self.nsegs]
             _not_sort = self.cfg.not_sort_by_rmsd
             self.cfg.not_sort_by_rmsd = not self.objective.cfg.real_space_use_pcoord
