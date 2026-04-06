@@ -1357,17 +1357,17 @@ class Objective:
 
     def mdbirch_scoring(self, all_X: np.ndarray) -> np.ndarray:
         """
-        Score frames using mdBIRCH clustering.
+        Score frames using mdBIRCH
 
         Low score = novel = split candidate. High score = redundant = merge candidate.
-
-        - Singletons: score = -min_distance_to_nearest_non_singleton_centroid.
-          More isolated singletons get more negative scores, so they are split first.
-          If no non-singleton clusters exist, singletons remain at 0.
-        - Non-singletons: score = cluster_size - normalized_distance_to_centroid,
-          so score is within [cluster_size-1, cluster_size). Larger clusters score higher.
-          Within a cluster, points closer to the centroid score
-          higher (merge) and peripheral points score lower (split).
+        - Singletons: score = -min_squared_distance_to_nearest_non_singleton_centroid - GAP.
+        More isolated singletons get more negative scores (< -1), split first.
+        If no non-singleton clusters exist, singletons remain at 0.
+        - Non-singletons: score = -normalized_distance_to_centroid, in [-1, 0].
+        Central points score near 0 (merge), peripheral points score near -1 (split).
+        Normalization is per-cluster so all clusters contribute equally to the split pool.
+        
+        GAP = 1 + 1e-6 ensures all singletons always rank below all non-singletons.
         """
         mdbirch.set_merge('radius', features=all_X.shape[1])
         model = mdbirch.mdBirch(threshold=self.cfg.birch_threshold, branching_factor=50)
@@ -1376,22 +1376,34 @@ class Objective:
         mol_ids = model.get_cluster_mol_ids()
         centroids = model.get_centroids()
 
+        is_singleton = [len(ids) == 1 for ids in mol_ids]
         non_singleton_centroids = np.array([c for ids, c in zip(mol_ids, centroids) if len(ids) > 1])
-        print(f"mdBIRCH: {len(mol_ids)} clusters, {sum(len(ids) == 1 for ids in mol_ids)} singletons out of {len(all_X)} points")
+        print(f"mdBIRCH: {len(mol_ids)} clusters, {sum(is_singleton)} singletons out of {len(all_X)} points")
 
         scores = np.zeros(len(all_X))
-        for ids, centroid in zip(mol_ids, centroids):
-            cluster_size = len(ids)
-            if cluster_size == 1:
-                if len(non_singleton_centroids) > 0:
-                    diffs = non_singleton_centroids - centroid
-                    scores[ids[0]] = -np.min(np.sum(diffs ** 2, axis=1))
-            else:
+
+        # non-singletons
+        if any(not s for s in is_singleton):
+            ns_ids_list = [ids for ids, s in zip(mol_ids, is_singleton) if not s]
+            ns_centroids_list = [c for ids, c, s in zip(mol_ids, centroids, is_singleton) if not s]
+            
+            for ids, centroid in zip(ns_ids_list, ns_centroids_list):
                 diffs = all_X[ids] - centroid
-                sq_dists = np.sum(diffs ** 2, axis=1)
-                max_dist = sq_dists.max()
-                norm_dists = sq_dists / max_dist if max_dist > 0 else sq_dists
-                scores[ids] = cluster_size - norm_dists
+                within_dists = np.sum(diffs ** 2, axis=1)
+                max_dist = within_dists.max()
+                norm_dists = within_dists / (max_dist + 1e-10)  # [0, 1] per cluster
+                scores[ids] = -norm_dists  # central=0, peripheral=-1
+            
+            GAP = 1.0 + 1e-6  # fixed, since scores are in [-1, 0]
+        else:
+            GAP = 1.0 + 1e-6
+
+        # singletons
+        if any(is_singleton) and len(non_singleton_centroids) > 0:
+            s_ids = np.array([ids[0] for ids, s in zip(mol_ids, is_singleton) if s])
+            s_centroids = np.array([c for ids, c, s in zip(mol_ids, centroids, is_singleton) if s])
+            diffs = s_centroids[:, np.newaxis, :] - non_singleton_centroids[np.newaxis, :, :]
+            scores[s_ids] = -np.min(np.sum(diffs ** 2, axis=2), axis=1) - GAP
 
         return scores
 
