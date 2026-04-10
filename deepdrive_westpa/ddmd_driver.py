@@ -105,6 +105,7 @@ class DeepDriveMDDriver(WEDriver, ABC):
         self.rng = np.random.default_rng()
         self.segments = None
         self.bin = None
+        self._mdbirch_model = None
         # Note: Several of the getter methods that return npt.ArrayLike
         # objects use a [:, 1:] index trick to avoid the initial frame
         # in westpa segments which corresponds to the last frame of the
@@ -650,6 +651,7 @@ class DeepDriveMDDriver(WEDriver, ABC):
                 self.niter = cur_segments[0].n_iter
                 self.nsegs = self.cur_pcoords.shape[0]
                 self.nframes = self.cur_pcoords.shape[1]
+                print(f"nsegs={self.nsegs}, nframes={self.nframes}")
 
                 self.run(bin_, cur_segments, segments)
 
@@ -918,9 +920,12 @@ class ObjectiveSettings(BaseModel):
     # Maximum total number of past latent space points to save for the lof scheme.
     max_past_points: Optional[int] = 2000
     # Number of past iterations to include as context. None means use rolled context files (default behaviour).
-    context_window: Optional[int] = None
+    context_window: Optional[int] = 2001
     # mdBIRCH radius threshold; used when objective_method == "mdbirch".
     birch_threshold: Optional[float] = 0.5
+    # Use incremental mdBIRCH: persist the tree across iterations, inserting only new frames each iteration.
+    # All historical data is implicitly retained in the tree; no context files are written.
+    birch_incremental: Optional[bool] = True
     # Number of neighbors for LOF.
     lof_n_neighbors: Optional[int] = 20
     # Maximum number of contact maps to save from each cluster.
@@ -1405,6 +1410,68 @@ class Objective:
             diffs = s_centroids[:, np.newaxis, :] - non_singleton_centroids[np.newaxis, :, :]
             scores[s_ids] = -np.min(np.sum(diffs ** 2, axis=2), axis=1) - GAP
 
+        return scores
+
+    def mdbirch_scoring_incremental(self, model, cur_X: np.ndarray, prev_total: int) -> np.ndarray:
+        """Score only current walkers using a pre-fitted incremental mdBIRCH model.
+
+        Uses CF stats (sq_sum, n_samples_, centroid_) stored in each subcluster for
+        normalization, so no historical coordinates need to be retained.
+
+        Low score = novel = split candidate. High score = redundant = merge candidate.
+        Same semantics as mdbirch_scoring, but operates only on the nsegs new frames.
+        """
+        _t0 = time.perf_counter()
+
+        mol_ids = model.get_cluster_mol_ids()
+        centroids = model.get_centroids()
+        nsegs = len(cur_X)
+
+        # Map global index -> local index for current walkers
+        global_to_local = {prev_total + i: i for i in range(nsegs)}
+
+        # Collect per-cluster stats in the same order as mol_ids/centroids
+        sc_n = []
+        sc_msd = []
+        for leaf in model._get_leaves():
+            for sc in leaf.subclusters_:
+                n = sc.n_samples_
+                msd = float(np.sum(sc.sq_sum) / n - np.dot(sc.centroid_, sc.centroid_))
+                sc_n.append(n)
+                sc_msd.append(max(msd, 1e-10))
+
+        is_singleton = [n == 1 for n in sc_n]
+        non_singleton_centroids = (
+            np.array([c for c, s in zip(centroids, is_singleton) if not s])
+            if any(not s for s in is_singleton)
+            else np.array([])
+        )
+
+        scores = np.zeros(nsegs)
+        GAP = 1.0 + 1e-6
+
+        for cluster_idx, (ids, centroid) in enumerate(zip(mol_ids, centroids)):
+            cur_locals = [global_to_local[g] for g in ids if g in global_to_local]
+            if not cur_locals:
+                continue
+            if is_singleton[cluster_idx]:
+                if len(non_singleton_centroids) > 0:
+                    diffs = centroid[np.newaxis, :] - non_singleton_centroids
+                    min_dist_sq = float(np.min(np.sum(diffs ** 2, axis=1)))
+                    for li in cur_locals:
+                        scores[li] = -min_dist_sq - GAP
+            else:
+                norm = sc_msd[cluster_idx]
+                for li in cur_locals:
+                    dist_sq = float(np.sum((cur_X[li] - centroid) ** 2))
+                    scores[li] = -dist_sq / norm
+
+        _t1 = time.perf_counter()
+        print(
+            f"[mdbirch] scoring took {_t1 - _t0:.3f}s | "
+            f"{len(mol_ids)} clusters, {sum(is_singleton)} singletons, "
+            f"{model.index_tracker} total frames seen"
+        )
         return scores
 
 class DDWESettings(BaseModel):
@@ -2113,7 +2180,32 @@ class CustomDriver(DeepDriveMDDriver):
             # 1. current Cα coordinates
             cur_rcoords = self.get_realspace_ca_coords(cur_segments)
 
-            if self.objective.cfg.context_window is not None:
+            if self.objective.cfg.birch_incremental:
+                # Preprocess only current walkers — no historical coords needed
+                cur_X, n_atoms = self.preprocess_realspace_rcoords(cur_rcoords)
+
+                if self._mdbirch_model is None:
+                    mdbirch.set_merge('radius', features=cur_X.shape[1])
+                    self._mdbirch_model = mdbirch.mdBirch(
+                        threshold=self.objective.cfg.birch_threshold, branching_factor=50
+                    )
+
+                prev_total = self._mdbirch_model.index_tracker
+                import time
+                _t0 = time.perf_counter()
+                self._mdbirch_model.fit(cur_X)
+                _t1 = time.perf_counter()
+                total_size = self._mdbirch_model.index_tracker
+                print(
+                    f"[mdbirch] fit took {_t1 - _t0:.3f}s | "
+                    f"dataset size: {prev_total} -> {total_size} (+{total_size - prev_total})"
+                )
+
+                df["real_space_score"] = self.objective.mdbirch_scoring_incremental(
+                    self._mdbirch_model, cur_X, prev_total
+                )
+
+            elif self.objective.cfg.context_window is not None:
                 # 2. load cur + past N iterations directly from west.h5
                 all_rcoords = self.get_prev_rcoords_training(cur_rcoords, self.objective.cfg.context_window)
                 all_X, n_atoms = self.preprocess_realspace_rcoords(all_rcoords)
@@ -2134,9 +2226,7 @@ class CustomDriver(DeepDriveMDDriver):
                 log.debug(f"all_X shape: {all_X.shape}")
 
                 # 4. score current + context
-
                 all_real_space_scores = self.objective.mdbirch_scoring(all_X)
-
 
                 # 5. keep only current walkers for resampling
                 df["real_space_score"] = all_real_space_scores[: self.nsegs]
