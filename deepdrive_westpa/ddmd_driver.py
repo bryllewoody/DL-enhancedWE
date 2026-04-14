@@ -1368,9 +1368,9 @@ class Objective:
         - Singletons: score = -min_squared_distance_to_nearest_non_singleton_centroid - GAP.
         More isolated singletons get more negative scores (< -1), split first.
         If no non-singleton clusters exist, singletons remain at 0.
-        - Non-singletons: score = -normalized_distance_to_centroid, in [-1, 0].
+        - Non-singletons: score = -dist_to_centroid² / threshold², in [-1, 0].
         Central points score near 0 (merge), peripheral points score near -1 (split).
-        Normalization is per-cluster so all clusters contribute equally to the split pool.
+        BIRCH guarantees all members are within threshold of their centroid, so scores stay in [-1, 0].
         
         GAP = 1 + 1e-6 ensures all singletons always rank below all non-singletons.
         """
@@ -1386,24 +1386,20 @@ class Objective:
         print(f"mdBIRCH: {len(mol_ids)} clusters, {sum(is_singleton)} singletons out of {len(all_X)} points")
 
         scores = np.zeros(len(all_X))
+        norm = self.cfg.birch_threshold ** 2
+        GAP = 1.0 + 1e-6
 
-        # non-singletons
+        # non-singletons: normalized distance to centroid in [-1, 0]
         if any(not s for s in is_singleton):
             ns_ids_list = [ids for ids, s in zip(mol_ids, is_singleton) if not s]
             ns_centroids_list = [c for ids, c, s in zip(mol_ids, centroids, is_singleton) if not s]
-            
+
             for ids, centroid in zip(ns_ids_list, ns_centroids_list):
                 diffs = all_X[ids] - centroid
                 within_dists = np.sum(diffs ** 2, axis=1)
-                max_dist = within_dists.max()
-                norm_dists = within_dists / (max_dist + 1e-10)  # [0, 1] per cluster
-                scores[ids] = -norm_dists  # central=0, peripheral=-1
-            
-            GAP = 1.0 + 1e-6  # fixed, since scores are in [-1, 0]
-        else:
-            GAP = 1.0 + 1e-6
+                scores[ids] = -within_dists / norm
 
-        # singletons
+        # singletons: penalized by distance to nearest non-singleton centroid
         if any(is_singleton) and len(non_singleton_centroids) > 0:
             s_ids = np.array([ids[0] for ids, s in zip(mol_ids, is_singleton) if s])
             s_centroids = np.array([c for ids, c, s in zip(mol_ids, centroids, is_singleton) if s])
@@ -1427,20 +1423,14 @@ class Objective:
         centroids = model.get_centroids()
         nsegs = len(cur_X)
 
-        # Map global index -> local index for current walkers
+        # map global walker index to local (current batch) index
         global_to_local = {prev_total + i: i for i in range(nsegs)}
 
-        # Collect per-cluster stats in the same order as mol_ids/centroids
-        sc_n = []
-        sc_msd = []
-        for leaf in model._get_leaves():
-            for sc in leaf.subclusters_:
-                n = sc.n_samples_
-                msd = float(np.sum(sc.sq_sum) / n - np.dot(sc.centroid_, sc.centroid_))
-                sc_n.append(n)
-                sc_msd.append(max(msd, 1e-10))
-
+        # singleton flag from cluster size; threshold² as stable per-cluster norm
+        sc_n = [len(ids) for ids in mol_ids]
         is_singleton = [n == 1 for n in sc_n]
+        norm = self.cfg.birch_threshold ** 2
+
         non_singleton_centroids = (
             np.array([c for c, s in zip(centroids, is_singleton) if not s])
             if any(not s for s in is_singleton)
@@ -1461,7 +1451,6 @@ class Objective:
                     for li in cur_locals:
                         scores[li] = -min_dist_sq - GAP
             else:
-                norm = sc_msd[cluster_idx]
                 for li in cur_locals:
                     dist_sq = float(np.sum((cur_X[li] - centroid) ** 2))
                     scores[li] = -dist_sq / norm
