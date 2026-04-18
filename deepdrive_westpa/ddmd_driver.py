@@ -6,7 +6,7 @@ from copy import deepcopy
 from os.path import expandvars
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional, Sequence, Tuple, Union
+from typing import Any, ClassVar, Dict, Generator, List, Optional, Sequence, Tuple, Union
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -908,7 +908,7 @@ class ObjectiveSettings(BaseModel):
     # Function to measure distance between latent space points (cosine or euclidean).
     distance_metric: Optional[str] = "cosine"
     # Distance metric for real-space LOF (real_lof method). Defaults to euclidean
-    # because LOF is applied to aligned Cα coordinates where structural dissimilarity
+    # because LOF is applied to aligned Ca coordinates where structural dissimilarity
     # equals Euclidean distance. Cosine distance is inappropriate here.
     real_space_lof_metric: Optional[str] = "euclidean"
     # How many walkers to consider for splitting and merging in real_space mode.
@@ -926,6 +926,8 @@ class ObjectiveSettings(BaseModel):
     # Use incremental mdBIRCH: persist the tree across iterations, inserting only new frames each iteration.
     # All historical data is implicitly retained in the tree; no context files are written.
     birch_incremental: Optional[bool] = True
+    # Scoring variant for mdBIRCH. 
+    birch_scoring_method: Optional[str] = "distance"
     # Number of neighbors for LOF.
     lof_n_neighbors: Optional[int] = 20
     # Maximum number of contact maps to save from each cluster.
@@ -1360,22 +1362,38 @@ class Objective:
         ]
         return np.array(seg_labels)
 
-    def mdbirch_scoring(self, all_X: np.ndarray) -> np.ndarray:
-        """
-        Score frames using mdBIRCH
+    # mdBIRCH scoring
+    # To add a new mdBIRCH scoring variant
+    #   1. Define _mdbirch_scoring_foo(self, all_X) -> np.ndarray
+    #   2. Define _mdbirch_scoring_incremental_foo(self, model, cur_X, prev_total) -> np.ndarray
 
-        Low score = novel = split candidate. High score = redundant = merge candidate.
-        - Singletons: score = -min_squared_distance_to_nearest_non_singleton_centroid - GAP.
-        More isolated singletons get more negative scores (< -1), split first.
-        If no non-singleton clusters exist, singletons remain at 0.
-        - Non-singletons: score = -dist_to_centroid² / threshold², in [-1, 0].
-        Central points score near 0 (merge), peripheral points score near -1 (split).
-        BIRCH guarantees all members are within threshold of their centroid, so scores stay in [-1, 0].
-        
-        GAP = 1 + 1e-6 ensures all singletons always rank below all non-singletons.
+    _SCORING_REGISTRY: ClassVar[dict] = {
+        "distance": ("_mdbirch_scoring_distance", "_mdbirch_scoring_incremental_distance"),
+        "size":     ("_mdbirch_scoring_size",     "_mdbirch_scoring_incremental_size"),
+    }
+
+    def mdbirch_scoring(self, all_X: np.ndarray) -> np.ndarray:
+        key = (self.cfg.birch_scoring_method or "distance").lower()
+        batch_fn, _ = self._SCORING_REGISTRY[key]
+        return getattr(self, batch_fn)(all_X)
+
+    def mdbirch_scoring_incremental(self, model, cur_X: np.ndarray, prev_total: int) -> np.ndarray:
+        key = (self.cfg.birch_scoring_method or "distance").lower()
+        _, inc_fn = self._SCORING_REGISTRY[key]
+        return getattr(self, inc_fn)(model, cur_X, prev_total)
+
+    # mdBIRCH scoring: distance
+
+    def _mdbirch_scoring_distance(self, all_X: np.ndarray) -> np.ndarray:
+        """Batch distance scoring.
+
+        Non-singletons: score = -dist² / threshold² in [-1, 0].
+        Singletons:     score = -min_dist²_to_nearest_non_singleton - GAP (< -1).
+        GAP = 1+1e-6 guarantees all singletons rank below all non-singletons.
         """
+        _t0 = time.perf_counter()
         mdbirch.set_merge('radius', features=all_X.shape[1])
-        model = mdbirch.mdBirch(threshold=self.cfg.birch_threshold, branching_factor=50)
+        model = mdbirch.mdBirch(threshold=self.cfg.birch_threshold, branching_factor=500)
         model.fit(all_X)
 
         mol_ids = model.get_cluster_mol_ids()
@@ -1383,39 +1401,33 @@ class Objective:
 
         is_singleton = [len(ids) == 1 for ids in mol_ids]
         non_singleton_centroids = np.array([c for ids, c in zip(mol_ids, centroids) if len(ids) > 1])
-        print(f"mdBIRCH: {len(mol_ids)} clusters, {sum(is_singleton)} singletons out of {len(all_X)} points")
 
         scores = np.zeros(len(all_X))
         norm = self.cfg.birch_threshold ** 2
         GAP = 1.0 + 1e-6
 
-        # non-singletons: normalized distance to centroid in [-1, 0]
         if any(not s for s in is_singleton):
-            ns_ids_list = [ids for ids, s in zip(mol_ids, is_singleton) if not s]
-            ns_centroids_list = [c for ids, c, s in zip(mol_ids, centroids, is_singleton) if not s]
-
-            for ids, centroid in zip(ns_ids_list, ns_centroids_list):
+            for ids, centroid, s in zip(mol_ids, centroids, is_singleton):
+                if s:
+                    continue
                 diffs = all_X[ids] - centroid
-                within_dists = np.sum(diffs ** 2, axis=1)
-                scores[ids] = -within_dists / norm
+                scores[ids] = -np.sum(diffs ** 2, axis=1) / norm
 
-        # singletons: penalized by distance to nearest non-singleton centroid
         if any(is_singleton) and len(non_singleton_centroids) > 0:
             s_ids = np.array([ids[0] for ids, s in zip(mol_ids, is_singleton) if s])
             s_centroids = np.array([c for ids, c, s in zip(mol_ids, centroids, is_singleton) if s])
             diffs = s_centroids[:, np.newaxis, :] - non_singleton_centroids[np.newaxis, :, :]
             scores[s_ids] = -np.min(np.sum(diffs ** 2, axis=2), axis=1) - GAP
 
+        n_singletons = sum(is_singleton)
+        print(f"[mdbirch] score | {len(mol_ids)} clusters, {n_singletons} singletons, {len(all_X)} points | {time.perf_counter() - _t0:.3f}s")
         return scores
 
-    def mdbirch_scoring_incremental(self, model, cur_X: np.ndarray, prev_total: int) -> np.ndarray:
-        """Score only current walkers using a pre-fitted incremental mdBIRCH model.
+    def _mdbirch_scoring_incremental_distance(self, model, cur_X: np.ndarray, prev_total: int) -> np.ndarray:
+        """Incremental distance scoring.
 
-        Uses CF stats (sq_sum, n_samples_, centroid_) stored in each subcluster for
-        normalization, so no historical coordinates need to be retained.
-
-        Low score = novel = split candidate. High score = redundant = merge candidate.
-        Same semantics as mdbirch_scoring, but operates only on the nsegs new frames.
+        Non-singletons: score = -dist² / threshold² in [-1, 0].
+        Singletons:     score = -min_dist²_to_nearest_non_singleton - GAP (< -1).
         """
         _t0 = time.perf_counter()
 
@@ -1423,12 +1435,8 @@ class Objective:
         centroids = model.get_centroids()
         nsegs = len(cur_X)
 
-        # map global walker index to local (current batch) index
         global_to_local = {prev_total + i: i for i in range(nsegs)}
-
-        # singleton flag from cluster size; threshold² as stable per-cluster norm
-        sc_n = [len(ids) for ids in mol_ids]
-        is_singleton = [n == 1 for n in sc_n]
+        is_singleton = [len(ids) == 1 for ids in mol_ids]
         norm = self.cfg.birch_threshold ** 2
 
         non_singleton_centroids = (
@@ -1455,12 +1463,86 @@ class Objective:
                     dist_sq = float(np.sum((cur_X[li] - centroid) ** 2))
                     scores[li] = -dist_sq / norm
 
-        _t1 = time.perf_counter()
-        print(
-            f"[mdbirch] scoring took {_t1 - _t0:.3f}s | "
-            f"{len(mol_ids)} clusters, {sum(is_singleton)} singletons, "
-            f"{model.index_tracker} total frames seen"
-        )
+        n_singletons = sum(is_singleton)
+        print(f"[mdbirch] score | {len(mol_ids)} clusters, {n_singletons} singletons, {model.index_tracker} total | {time.perf_counter() - _t0:.3f}s")
+        return scores
+
+    # mdBIRCH scoring: size
+
+    def _mdbirch_scoring_size(self, all_X: np.ndarray) -> np.ndarray:
+        """Batch size scoring.
+
+        Non-singletons: score = cluster_size - norm_dist in [cluster_size-1, cluster_size).
+          Per-cluster normalization by max within-cluster distance.
+          Larger clusters score higher (merge). Peripheral points score lower (split).
+        Singletons: score = -min_dist²_to_nearest_non_singleton_centroid (negative).
+          More isolated singletons score more negative (split first).
+          If no non-singletons exist, singletons remain at 0.
+        """
+        _t0 = time.perf_counter()
+        mdbirch.set_merge('radius', features=all_X.shape[1])
+        model = mdbirch.mdBirch(threshold=self.cfg.birch_threshold, branching_factor=50)
+        model.fit(all_X)
+
+        mol_ids = model.get_cluster_mol_ids()
+        centroids = model.get_centroids()
+
+        non_singleton_centroids = np.array([c for ids, c in zip(mol_ids, centroids) if len(ids) > 1])
+
+        scores = np.zeros(len(all_X))
+        for ids, centroid in zip(mol_ids, centroids):
+            cluster_size = len(ids)
+            if cluster_size == 1:
+                if len(non_singleton_centroids) > 0:
+                    diffs = non_singleton_centroids - centroid
+                    scores[ids[0]] = -np.min(np.sum(diffs ** 2, axis=1))
+            else:
+                diffs = all_X[ids] - centroid
+                sq_dists = np.sum(diffs ** 2, axis=1)
+                max_dist = sq_dists.max()
+                norm_dists = sq_dists / max_dist if max_dist > 0 else sq_dists
+                scores[ids] = cluster_size - norm_dists
+
+        n_singletons = sum(len(ids) == 1 for ids in mol_ids)
+        print(f"[mdbirch] score | {len(mol_ids)} clusters, {n_singletons} singletons, {len(all_X)} points | {time.perf_counter() - _t0:.3f}s")
+        return scores
+
+    def _mdbirch_scoring_incremental_size(self, model, cur_X: np.ndarray, prev_total: int) -> np.ndarray:
+        """Incremental size scoring.
+
+        Non-singletons: score = cluster_size - dist² / threshold².
+          Larger clusters score higher. Points closer to centroid score higher.
+        Singletons: score = -min_dist²_to_nearest_non_singleton_centroid.
+        """
+        _t0 = time.perf_counter()
+
+        mol_ids = model.get_cluster_mol_ids()
+        centroids = model.get_centroids()
+        nsegs = len(cur_X)
+
+        global_to_local = {prev_total + i: i for i in range(nsegs)}
+        norm = self.cfg.birch_threshold ** 2
+        non_singleton_centroids = np.array([c for ids, c in zip(mol_ids, centroids) if len(ids) > 1])
+
+        scores = np.zeros(nsegs)
+
+        for ids, centroid in zip(mol_ids, centroids):
+            cur_locals = [global_to_local[g] for g in ids if g in global_to_local]
+            if not cur_locals:
+                continue
+            cluster_size = len(ids)
+            if cluster_size == 1:
+                if len(non_singleton_centroids) > 0:
+                    diffs = non_singleton_centroids - centroid
+                    for li in cur_locals:
+                        scores[li] = -np.min(np.sum(diffs ** 2, axis=1))
+            else:
+                for li in cur_locals:
+                    dist_sq = float(np.sum((cur_X[li] - centroid) ** 2))
+                    scores[li] = cluster_size - dist_sq / norm
+
+        n_singletons = sum(len(ids) == 1 for ids in mol_ids)
+        print(f"[mdbirch] score | {len(mol_ids)} clusters, {n_singletons} singletons, {model.index_tracker} total | {time.perf_counter() - _t0:.3f}s")
         return scores
 
 class DDWESettings(BaseModel):
@@ -2025,14 +2107,14 @@ class CustomDriver(DeepDriveMDDriver):
         except KeyError:
             rcoords = self.get_restart_rcoords()
 
-        # concatenate current end-of-segment frames
-        rcoords = np.concatenate(rcoords)  # (n_samples, n_atoms, 3)
+        rcoords = np.asarray(rcoords)[:, -1, :, :]  # (nsegs, n_atoms, 3), last frame only
 
         if self.realspace_atom_indices is None:
             raise ValueError("No real-space atom selection is available.")
 
-        # select Cα atoms only
-        rcoords = rcoords[:, self.realspace_atom_indices, :]  # (n_samples, n_ca, 3)
+        # select Ca atoms only
+        rcoords = rcoords[:, self.realspace_atom_indices, :]  # (nsegs, n_ca, 3)
+        return rcoords
         return rcoords
     
     def get_prev_rcoords_training(self, cur_rcoords: np.ndarray, iters_back: int) -> np.ndarray:
@@ -2050,12 +2132,12 @@ class CustomDriver(DeepDriveMDDriver):
         n_samples, n_atoms, _ = rcoords.shape
 
         if self.realspace_top is not None:
-            # Build a Cα-only reference (mdtraj loads in nm; convert to Angstroms to match rcoords)
+            # Build a Ca-only reference 
             ca_ref = self.realspace_top.atom_slice(self.realspace_atom_indices)
-            ref_coords_ang = ca_ref.xyz * 10  # nm → Å
+            ref_coords_ang = ca_ref.xyz 
             ca_ref_ang = mdtraj.Trajectory(ref_coords_ang, topology=ca_ref.top)
 
-            # Build trajectory from current Cα coords (already in Å)
+            # Build trajectory from current Ca coords
             traj = mdtraj.Trajectory(rcoords, topology=ca_ref.top)
 
             # Superpose all frames onto the fixed reference
@@ -2166,29 +2248,23 @@ class CustomDriver(DeepDriveMDDriver):
         if self.objective.cfg.objective_method == "real_mdbirch":
             self.target_point = None
 
-            # 1. current Cα coordinates
+            # 1. current Ca coordinates
             cur_rcoords = self.get_realspace_ca_coords(cur_segments)
 
             if self.objective.cfg.birch_incremental:
-                # Preprocess only current walkers — no historical coords needed
+                # Preprocess only current walkers: no historical coords needed
                 cur_X, n_atoms = self.preprocess_realspace_rcoords(cur_rcoords)
-
                 if self._mdbirch_model is None:
                     mdbirch.set_merge('radius', features=cur_X.shape[1])
                     self._mdbirch_model = mdbirch.mdBirch(
-                        threshold=self.objective.cfg.birch_threshold, branching_factor=50
+                        threshold=self.objective.cfg.birch_threshold, branching_factor=500
                     )
 
                 prev_total = self._mdbirch_model.index_tracker
-                import time
                 _t0 = time.perf_counter()
                 self._mdbirch_model.fit(cur_X)
-                _t1 = time.perf_counter()
                 total_size = self._mdbirch_model.index_tracker
-                print(
-                    f"[mdbirch] fit took {_t1 - _t0:.3f}s | "
-                    f"dataset size: {prev_total} -> {total_size} (+{total_size - prev_total})"
-                )
+                print(f"[mdbirch] fit   | {cur_X.shape} | {prev_total} → {total_size} (+{total_size - prev_total}) | {time.perf_counter() - _t0:.3f}s")
 
                 df["real_space_score"] = self.objective.mdbirch_scoring_incremental(
                     self._mdbirch_model, cur_X, prev_total
@@ -2198,7 +2274,6 @@ class CustomDriver(DeepDriveMDDriver):
                 # 2. load cur + past N iterations directly from west.h5
                 all_rcoords = self.get_prev_rcoords_training(cur_rcoords, self.objective.cfg.context_window)
                 all_X, n_atoms = self.preprocess_realspace_rcoords(all_rcoords)
-                print(f"all_X shape: {all_X.shape}")
 
                 # 3. score current + context
                 all_real_space_scores = self.objective.mdbirch_scoring(all_X)
