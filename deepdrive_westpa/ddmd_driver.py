@@ -1364,8 +1364,8 @@ class Objective:
 
     # mdBIRCH scoring
     # To add a new mdBIRCH scoring variant
-    #   1. Define _mdbirch_scoring_foo(self, all_X) -> np.ndarray
-    #   2. Define _mdbirch_scoring_incremental_foo(self, model, cur_X, prev_total) -> np.ndarray
+    #   1. Define _mdbirch_scoring_Y(self, all_X) -> np.ndarray
+    #   2. Define _mdbirch_scoring_incremental_Y (self, model, cur_X, prev_total) -> np.ndarray
 
     _SCORING_REGISTRY: ClassVar[dict] = {
         "distance": ("_mdbirch_scoring_distance", "_mdbirch_scoring_incremental_distance"),
@@ -1387,9 +1387,13 @@ class Objective:
     def _mdbirch_scoring_distance(self, all_X: np.ndarray) -> np.ndarray:
         """Batch distance scoring.
 
-        Non-singletons: score = -dist² / threshold² in [-1, 0].
-        Singletons:     score = -min_dist²_to_nearest_non_singleton - GAP (< -1).
-        GAP = 1+1e-6 guarantees all singletons rank below all non-singletons.
+        Non-singletons: score = -dist^2 / threshold^2.
+          Normalization by threshold^2.
+          Points closer to centroid score higher (merge). Peripheral points score lower (split).
+        Singletons: score = -min_dist^2_to_nearest_non_singleton - GAP (< -1).
+          GAP = 1+1e-6 guarantees all singletons rank below all non-singletons.
+          More isolated singletons score more negative (split first).
+          If no non-singletons exist, singletons remain at 0.
         """
         _t0 = time.perf_counter()
         mdbirch.set_merge('radius', features=all_X.shape[1])
@@ -1426,8 +1430,13 @@ class Objective:
     def _mdbirch_scoring_incremental_distance(self, model, cur_X: np.ndarray, prev_total: int) -> np.ndarray:
         """Incremental distance scoring.
 
-        Non-singletons: score = -dist² / threshold² in [-1, 0].
-        Singletons:     score = -min_dist²_to_nearest_non_singleton - GAP (< -1).
+        Non-singletons: score = -dist^2 / threshold^2.
+          Normalization by threshold^2.
+          Points closer to centroid score higher (merge). Peripheral points score lower (split).
+        Singletons: score = -min_dist^2_to_nearest_non_singleton - GAP (< -1).
+          GAP = 1+1e-6 guarantees all singletons rank below all non-singletons.
+          More isolated singletons score more negative (split first).
+          If no non-singletons exist, singletons remain at 0.
         """
         _t0 = time.perf_counter()
 
@@ -1472,10 +1481,10 @@ class Objective:
     def _mdbirch_scoring_size(self, all_X: np.ndarray) -> np.ndarray:
         """Batch size scoring.
 
-        Non-singletons: score = cluster_size - norm_dist in [cluster_size-1, cluster_size).
-          Per-cluster normalization by max within-cluster distance.
+        Non-singletons: score = cluster_size - dist^2 / threshold^2.
+          Normalization by threshold^2.
           Larger clusters score higher (merge). Peripheral points score lower (split).
-        Singletons: score = -min_dist²_to_nearest_non_singleton_centroid (negative).
+        Singletons: score = -min_dist^2_to_nearest_non_singleton_centroid (negative).
           More isolated singletons score more negative (split first).
           If no non-singletons exist, singletons remain at 0.
         """
@@ -1488,6 +1497,7 @@ class Objective:
         centroids = model.get_centroids()
 
         non_singleton_centroids = np.array([c for ids, c in zip(mol_ids, centroids) if len(ids) > 1])
+        norm = self.cfg.birch_threshold ** 2
 
         scores = np.zeros(len(all_X))
         for ids, centroid in zip(mol_ids, centroids):
@@ -1498,10 +1508,7 @@ class Objective:
                     scores[ids[0]] = -np.min(np.sum(diffs ** 2, axis=1))
             else:
                 diffs = all_X[ids] - centroid
-                sq_dists = np.sum(diffs ** 2, axis=1)
-                max_dist = sq_dists.max()
-                norm_dists = sq_dists / max_dist if max_dist > 0 else sq_dists
-                scores[ids] = cluster_size - norm_dists
+                scores[ids] = cluster_size - np.sum(diffs ** 2, axis=1) / norm
 
         n_singletons = sum(len(ids) == 1 for ids in mol_ids)
         print(f"[mdbirch] score | {len(mol_ids)} clusters, {n_singletons} singletons, {len(all_X)} points | {time.perf_counter() - _t0:.3f}s")
@@ -1510,9 +1517,12 @@ class Objective:
     def _mdbirch_scoring_incremental_size(self, model, cur_X: np.ndarray, prev_total: int) -> np.ndarray:
         """Incremental size scoring.
 
-        Non-singletons: score = cluster_size - dist² / threshold².
-          Larger clusters score higher. Points closer to centroid score higher.
-        Singletons: score = -min_dist²_to_nearest_non_singleton_centroid.
+        Non-singletons: score = cluster_size - dist^2 / threshold^2.
+          Per-point normalization by threshold^2.
+          Larger clusters score higher (merge). Peripheral points score lower (split).
+        Singletons: score = -min_dist^2_to_nearest_non_singleton_centroid (negative).
+          More isolated singletons score more negative (split first).
+          If no non-singletons exist, singletons remain at 0.
         """
         _t0 = time.perf_counter()
 
