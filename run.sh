@@ -7,4 +7,4 @@ source env.sh
 rm -f west.log
 
 # Run w_run
-w_run --n-workers 12 "$@" > west.log
+w_run --n-workers 1 "$@" > west.log

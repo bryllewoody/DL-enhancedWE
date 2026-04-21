@@ -1370,6 +1370,7 @@ class Objective:
     _SCORING_REGISTRY: ClassVar[dict] = {
         "distance": ("_mdbirch_scoring_distance", "_mdbirch_scoring_incremental_distance"),
         "size":     ("_mdbirch_scoring_size",     "_mdbirch_scoring_incremental_size"),
+        "kde":      ("_mdbirch_scoring_kde",      "_mdbirch_scoring_incremental_kde"),
     }
 
     def mdbirch_scoring(self, all_X: np.ndarray) -> np.ndarray:
@@ -1554,6 +1555,88 @@ class Objective:
         n_singletons = sum(len(ids) == 1 for ids in mol_ids)
         print(f"[mdbirch] score | {len(mol_ids)} clusters, {n_singletons} singletons, {model.index_tracker} total | {time.perf_counter() - _t0:.3f}s")
         return scores
+
+    # mdBIRCH scoring: kde
+
+    def _mdbirch_scoring_kde(self, all_X: np.ndarray) -> np.ndarray:
+        """Batch cluster-weighted KDE scoring.
+
+        Uses BIRCH centroids as kernel locations weighted by cluster size.  
+        An intra-cluster factor penalises points far from their own centroid 
+        so peripheral members score lower than core members of the same cluster.
+
+        score = inter_density * intra_factor
+          inter_density = sum_k( sizes[k] * exp(-0.5 * dist(x, c_k)^2 / h^2) )
+          intra_factor  = exp(-0.5 * dist(x, own_centroid)^2 / h^2)
+        Bandwidth h: Scott's rule on the K centroids, K^(-1/(D+4)).
+        """
+        _t0 = time.perf_counter()
+        mdbirch.set_merge('radius', features=all_X.shape[1])
+        model = mdbirch.mdBirch(threshold=self.cfg.birch_threshold, branching_factor=500)
+        model.fit(all_X)
+
+        leaves = model._get_leaves()
+        subclusters = [sc for leaf in leaves for sc in leaf.subclusters_]
+        centroids = np.array([sc.centroid_ for sc in subclusters])
+        sizes     = np.array([sc.n_samples_ for sc in subclusters], dtype=float)
+
+        N = len(all_X)
+        labels = np.empty(N, dtype=int)
+        for cid, sc in enumerate(subclusters):
+            for idx in sc.mol_indices:
+                labels[idx] = cid
+
+        K, D = centroids.shape
+        h = max(K ** (-1.0 / (D + 4)), 1e-6)
+
+        diff    = all_X[:, None, :] - centroids[None, :, :]   # (N, K, D)
+        sq_dist = np.sum(diff ** 2, axis=2)                    # (N, K)
+
+        inter_density = (np.exp(-0.5 * sq_dist / h ** 2) * sizes[None, :]).sum(axis=1)
+
+        intra_dist_sq = sq_dist[np.arange(N), labels]
+        intra_factor  = np.exp(-0.5 * intra_dist_sq / h ** 2)
+
+        scores = inter_density * intra_factor
+        print(f"[mdbirch] score | {K} clusters, {N} points | {time.perf_counter() - _t0:.3f}s")
+        return scores
+
+    def _mdbirch_scoring_incremental_kde(self, model, cur_X: np.ndarray, prev_total: int) -> np.ndarray:
+        """Incremental cluster-weighted KDE scoring.
+
+        Scores only the current batch of segments against the current tree
+        state. The nearest centroid is used as the intra-cluster reference,
+        which is equivalent to the cluster each point was inserted into and
+        avoids scanning all mol_indices.
+
+        score = inter_density * intra_factor
+          inter_density = sum_k( sizes[k] * exp(-0.5 * dist(x, c_k)^2 / h^2) )
+          intra_factor  = exp(-0.5 * dist(x, nearest_centroid)^2 / h^2)
+        Bandwidth h: Scott's rule on the K centroids, K^(-1/(D+4)).
+        """
+        _t0 = time.perf_counter()
+
+        leaves = model._get_leaves()
+        subclusters = [sc for leaf in leaves for sc in leaf.subclusters_]
+        centroids = np.array([sc.centroid_ for sc in subclusters])
+        sizes     = np.array([sc.n_samples_ for sc in subclusters], dtype=float)
+
+        K, D = centroids.shape
+        h = max(K ** (-1.0 / (D + 4)), 1e-6)
+        nsegs = len(cur_X)
+
+        diff    = cur_X[:, None, :] - centroids[None, :, :]   # (nsegs, K, D)
+        sq_dist = np.sum(diff ** 2, axis=2)                    # (nsegs, K)
+
+        inter_density = (np.exp(-0.5 * sq_dist / h ** 2) * sizes[None, :]).sum(axis=1)
+
+        nearest      = np.argmin(sq_dist, axis=1)
+        intra_factor = np.exp(-0.5 * sq_dist[np.arange(nsegs), nearest] / h ** 2)
+
+        scores = inter_density * intra_factor
+        print(f"[mdbirch] score | {K} clusters, {model.index_tracker} total | {time.perf_counter() - _t0:.3f}s")
+        return scores
+
 
 class DDWESettings(BaseModel):
     # Output directory for the run.
