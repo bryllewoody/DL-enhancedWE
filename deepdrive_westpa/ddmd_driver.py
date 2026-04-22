@@ -14,6 +14,7 @@ import numpy as np
 import numpy.typing as npt
 import pandas as pd
 from ast import literal_eval
+import synd.westpa.propagator
 
 mpl.use("Agg")
 
