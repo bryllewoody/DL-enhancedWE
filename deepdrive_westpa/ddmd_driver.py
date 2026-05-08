@@ -927,8 +927,13 @@ class ObjectiveSettings(BaseModel):
     # Use incremental mdBIRCH: persist the tree across iterations, inserting only new frames each iteration.
     # All historical data is implicitly retained in the tree; no context files are written.
     birch_incremental: Optional[bool] = True
-    # Scoring variant for mdBIRCH. 
+    # Scoring variant for mdBIRCH.
     birch_scoring_method: Optional[str] = "distance"
+    # Reference-free structural features for final candidate ordering (priority: contacts > sasa > rg).
+    use_rg_pcoord: Optional[bool] = False
+    use_sasa_pcoord: Optional[bool] = False
+    use_contacts_pcoord: Optional[bool] = False
+    contacts_cutoff: Optional[float] = 0.8
     # Number of neighbors for LOF.
     lof_n_neighbors: Optional[int] = 20
     # Maximum number of contact maps to save from each cluster.
@@ -2209,7 +2214,14 @@ class CustomDriver(DeepDriveMDDriver):
         # select Ca atoms only
         rcoords = rcoords[:, self.realspace_atom_indices, :]  # (nsegs, n_ca, 3)
         return rcoords
-        return rcoords
+
+    def get_realspace_full_coords(self, cur_segments: Sequence[Segment]) -> np.ndarray:
+        try:
+            rcoords = self.get_rcoords(cur_segments)
+        except KeyError:
+            rcoords = self.get_restart_rcoords()
+        return np.asarray(rcoords)[:, -1, :, :]  # (nsegs, n_atoms, 3), all atoms, last frame
+
     
     def get_prev_rcoords_training(self, cur_rcoords: np.ndarray, iters_back: int) -> np.ndarray:
         if self.niter <= 1 or iters_back == 0:
@@ -2243,15 +2255,51 @@ class CustomDriver(DeepDriveMDDriver):
             X = align_traj(X, N_atoms=n_atoms, align_method=self.realspace_cfg.align_method)
 
         return X, n_atoms
-    
-    def resample_with_real_mdbirch(self, df: pd.DataFrame):
+
+    def compute_rg(self, rcoords: np.ndarray) -> np.ndarray:
+        """Radius of gyration per frame (nm). Smaller = more compact = more folded."""
+        top = self.realspace_top.atom_slice(self.realspace_atom_indices)
+        traj = mdtraj.Trajectory(rcoords, topology=top.topology)
+        rg = mdtraj.compute_rg(traj)
+        print(f"[pcoord-rg] shape={rg.shape} min={rg.min():.4f} max={rg.max():.4f} mean={rg.mean():.4f} nm")  # TODO: remove
+        return rg
+
+    def compute_sasa(self, cur_all_atom_rcoords: np.ndarray) -> np.ndarray:
+        """Total SASA per frame (nm^2) using all atoms. Smaller = more buried = more folded."""
+        print(f"[pcoord-sasa] using all-atom coords: shape={cur_all_atom_rcoords.shape}, topology={self.realspace_top.topology}")  # TODO: remove
+        traj = mdtraj.Trajectory(cur_all_atom_rcoords, topology=self.realspace_top.topology)
+        sasa = mdtraj.shrake_rupley(traj, mode='residue').sum(axis=1)
+        print(f"[pcoord-sasa] shape={sasa.shape} min={sasa.min():.4f} max={sasa.max():.4f} mean={sasa.mean():.4f} nm^2")  # TODO: remove
+        return sasa
+
+    def compute_contact_count(self, rcoords: np.ndarray) -> np.ndarray:
+        """Number of Ca-Ca residue pairs within contacts_cutoff nm. More = more folded."""
+        top = self.realspace_top.atom_slice(self.realspace_atom_indices)
+        traj = mdtraj.Trajectory(rcoords, topology=top.topology)
+        distances, _ = mdtraj.compute_contacts(traj, scheme='ca')
+        contacts = (distances < self.objective.cfg.contacts_cutoff).sum(axis=1).astype(float)
+        print(f"[pcoord-contacts] cutoff={self.objective.cfg.contacts_cutoff} nm | shape={contacts.shape} min={contacts.min():.0f} max={contacts.max():.0f} mean={contacts.mean():.1f}")  # TODO: remove
+        return contacts
+
+    def resample_with_real_mdbirch(self, df: pd.DataFrame, cur_rcoords: np.ndarray = None, cur_all_atom_rcoords: np.ndarray = None):
         """
-        Resampling procedure using complementary similarity (real_space_score)
-        computed in real space.
+        Resampling procedure using mdBIRCH scoring obtained from real-space.
 
         Lower real_space_score -> more novel / more outlier-like -> split
         Higher real_space_score -> more redundant / more central -> merge
         """
+        cfg = self.objective.cfg
+        if cfg.use_contacts_pcoord and cur_rcoords is not None:
+            print(f"[resample] using contacts pcoord for split/merge ordering")  # TODO: remove
+            df["contacts"] = self.compute_contact_count(cur_rcoords)
+        elif cfg.use_sasa_pcoord and cur_all_atom_rcoords is not None:
+            print(f"[resample] using sasa pcoord for split/merge ordering")  # TODO: remove
+            df["sasa"] = self.compute_sasa(cur_all_atom_rcoords)
+        elif cfg.use_rg_pcoord and cur_rcoords is not None:
+            print(f"[resample] using rg pcoord for split/merge ordering")  # TODO: remove
+            df["rg"] = self.compute_rg(cur_rcoords)
+        else:
+            print(f"[resample] no structural pcoord active — falling back to real_space_score / pcoord ordering")  # TODO: remove
         if "real_space_score" in df.columns:
             # Lower real_space_score is more interesting
             df = df.sort_values("real_space_score", ascending=True)
@@ -2297,9 +2345,16 @@ class CustomDriver(DeepDriveMDDriver):
         print(f"Number of resamples based on the number of walkers: {num_resamples}")
 
         if num_resamples != 0:
-            if self.objective.cfg.real_space_use_pcoord:
-                # Same logic as LOF mode: sort both subsets by pcoord,
-                # then split picks from the front and merge picks from the tail.
+            if "contacts" in df.columns:
+                split_df = split_df.sort_values("contacts", ascending=False)
+                merge_df = merge_df.sort_values("contacts", ascending=True)
+            elif "sasa" in df.columns:
+                split_df = split_df.sort_values("sasa", ascending=True)
+                merge_df = merge_df.sort_values("sasa", ascending=False)
+            elif "rg" in df.columns:
+                split_df = split_df.sort_values("rg", ascending=True)
+                merge_df = merge_df.sort_values("rg", ascending=False)
+            elif self.objective.cfg.real_space_use_pcoord:
                 split_df = self.sort_df_lof(split_df)
                 merge_df = self.sort_df_lof(merge_df)
             else:
@@ -2393,7 +2448,10 @@ class CustomDriver(DeepDriveMDDriver):
                 self.objective.save_latent_context()
 
             # 7. run resampling (shared logic)
-            self.resample_with_real_mdbirch(df)
+            cur_all_atom_rcoords = self.get_realspace_full_coords(cur_segments) if self.objective.cfg.use_sasa_pcoord else None
+            if cur_all_atom_rcoords is not None:
+                print(f"[resample] loaded all-atom coords for SASA: shape={cur_all_atom_rcoords.shape}")  # TODO: remove
+            self.resample_with_real_mdbirch(df, cur_rcoords, cur_all_atom_rcoords)
             return
         
         if self.objective.cfg.objective_method == "real_lof":

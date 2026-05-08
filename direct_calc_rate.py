@@ -1,6 +1,6 @@
 """
 Calculate folding rate constant from w_ipa direct.h5 output.
-Reads ANALYSIS/TEST/direct.h5 produced by w_ipa / w_kinavg.
+Reads ANALYSIS/TEST/direct.h5 produced by w_ipa.
 """
 import h5py
 import numpy as np
@@ -76,6 +76,7 @@ ax.fill_between(iter_stop[mask],
 ax.axhline(mean_rate, color="red", linestyle="--", linewidth=1,
            label=f"mean = {mean_rate:.2e} s$^{{-1}}$")
 ax.set_yscale("log")
+ax.set_ylim(1e-12, 1e9)
 ax.yaxis.set_major_formatter(
     ticker.FuncFormatter(lambda y, _: f"$10^{{{int(np.log10(y))}}}$" if y > 0 else "")
 )
