@@ -28,6 +28,7 @@ from sklearn.neighbors import LocalOutlierFactor
 from sklearn.metrics.pairwise import cosine_distances, euclidean_distances
 
 import westpa
+import synd.westpa.propagator  # pre-load before threads are spawned to avoid partial-init race
 from westpa.core.binning import Bin
 from westpa.core.h5io import tostr
 from westpa.core.segment import Segment
